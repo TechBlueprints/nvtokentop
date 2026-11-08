@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nvtokentop"
+version = "0.1.0"
+description = "nvtop for tokens: live prompt and generation tok/s, requests in flight and implied memory bandwidth for local LLM servers (SGLang, vLLM, llama.cpp, llama-swap)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Clint Goudie-Nice" }]
+requires-python = ">=3.9"
+keywords = ["llm", "sglang", "vllm", "llama.cpp", "llama-swap", "nvtop", "tui", "monitoring"]
+classifiers = [
+    "Environment :: Console :: Curses",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Monitoring",
+]
+
+[project.urls]
+Homepage = "https://github.com/TechBlueprints/nvtokentop"
+
+[project.scripts]
+nvtokentop = "nvtokentop:main"
+
+[tool.setuptools]
+py-modules = ["nvtokentop"]

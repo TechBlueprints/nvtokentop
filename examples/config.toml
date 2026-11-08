@@ -1,0 +1,40 @@
+# nvtokentop example config.  Copy to ~/.config/nvtokentop/config.toml or
+# /etc/nvtokentop.toml, or pass --config.  Every key is optional.
+
+# Where models are listed: "llama-swap" (reads /running and the /api/events stream)
+# or "none" (only the [[backends]] below).
+router = "llama-swap"
+llama_swap = "http://127.0.0.1:8000"
+
+# Memory bandwidth spec in GB/s.  Leave it out to look it up from the GPU name.
+# peak_gbps = 273
+
+interval = 1.0   # seconds between samples
+window = 30      # seconds for the "avg" columns
+
+# Servers to watch directly, with or without llama-swap.
+# [[backends]]
+# name = "big-vllm"
+# url = "http://127.0.0.1:8001"
+# adapter = "vllm"        # default: detected from the /metrics prefix
+# weights_gb = 16.1       # vLLM and llama.cpp do not export their weight size
+#
+# [[backends]]
+# name = "small-llamacpp"
+# url = "http://127.0.0.1:8080"   # llama-server needs --metrics
+# weights_gb = 4.9
+
+# Per-model overrides for models llama-swap lists (keyed by its model name).
+# [models."qwen2.5-7b-instruct"]
+# weights_gb = 15.2
+
+# Override a built-in adapter's metric names (see --list-adapters) ...
+# [adapters.sglang]
+# passes = ["sglang:cuda_graph_passes_total/decode_cuda_graph"]
+#
+# ... or add one for another server, starting from a built-in.
+# [adapters.myserver]
+# base = "vllm"
+# prefix = "myserver:"
+# gen_total = "myserver:generation_tokens_total"
+# gen_live = ["myserver:generation_tokens_total"]
