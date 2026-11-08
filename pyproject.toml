@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nvtokentop"
-version = "0.1.0"
+version = "0.2.0"
 description = "nvtop for tokens: live prompt and generation tok/s, requests in flight and implied memory bandwidth for local LLM servers (SGLang, vLLM, llama.cpp, llama-swap)"
 readme = "README.md"
 license = { text = "Apache-2.0" }

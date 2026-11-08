@@ -59,6 +59,7 @@ needs 3.11 or newer, and older versions can use a JSON config instead.
 nvtokentop                      # TUI: header bars, stacked charts, per-model table
 nvtokentop --plain -n 5         # five text samples, no tty needed
 nvtokentop --router none --backend vllm=http://127.0.0.1:8001,weights_gb=16 --peak 1008
+nvtokentop --measure            # measure memory bandwidth now (GPU idle) and save it
 nvtokentop --list-adapters      # the built-in metric maps, as TOML
 ```
 
@@ -89,10 +90,26 @@ and reads the KV cache of the sequences being decoded. So:
 GB/s ≈ (weights + KV of running sequences) × forward passes per second
 ```
 
-Passes per second come from a counter that ticks once per decode pass. The percentage is
-against the GPU's bandwidth spec. It ignores activations and cache hits, so treat it as an
-estimate. On a GB10 it reads 190 to 260 GB/s of the 273 GB/s spec during single-stream decode,
-which is what you expect at the memory roofline.
+Passes per second come from a counter that ticks once per decode pass. It ignores
+activations and cache hits, so treat it as an estimate. On a GB10 it reads 190 to 260 GB/s
+during single-stream decode, which is what you expect at the memory roofline.
+
+**The percentage is against a measured peak when there is one.** The first time you start
+nvtokentop interactively without a configured peak, it offers to measure the GPU's memory
+bandwidth. Say yes only while the GPU is idle, with no requests decoding and no images
+rendering. A measurement shares memory with whatever else runs, so it reads low under load.
+nvtokentop also checks for itself: it names any model that is working, asks before measuring
+anyway, and throws away a result if a model did any work during the measurement.
+
+The measurement copies one 512 MiB GPU buffer to another through the CUDA driver API, best of
+three runs, and takes about a second. It needs no extra packages. The result is saved per GPU
+in `~/.local/state/nvtokentop/bandwidth.json`, and the bar is labelled `measured`. Answer
+"never" to skip the question for good, or run `nvtokentop --measure` any time to measure
+again. Until there is a measurement, the bar uses the GPU's spec figure and is labelled `spec`.
+
+A copy reads and writes, while decode mostly reads, so decode can run somewhat above the
+measured figure. On a GB10 the copy measured 236 GB/s against a 273 GB/s spec, while decode
+was seen as high as 260 GB/s. The utilization chart caps at 100 %.
 
 **Image models.** A diffusion server with no `/metrics` endpoint is still shown. With
 llama-swap, its row lists images in flight, images done and seconds per image, taken from
@@ -127,8 +144,9 @@ llama-swap on `127.0.0.1:8000`. See [examples/config.toml](examples/config.toml)
   with `base = "<built-in>"` and its own `prefix`. Run `--list-adapters` to see every key.
 - **Weights.** `weights_gb` on a backend, or under `[models."<name>"]` for a model llama-swap
   lists. Without it, GB/s shows `-` for servers that do not export their weight size.
-- **Bandwidth peak.** `peak_gbps` or `--peak`. Otherwise it is looked up from the GPU name
-  in a built-in table of spec figures. An unknown GPU shows GB/s with no percentage.
+- **Bandwidth peak.** `--peak` or `peak_gbps` wins. Otherwise nvtokentop uses the figure
+  measured on this GPU, then the spec from a built-in table of GPU names. An unknown GPU with
+  no measurement shows GB/s with no percentage.
 
 ## Limitations
 

@@ -19,8 +19,11 @@ Pluggable parts (all optional; with no config it watches llama-swap on 127.0.0.1
     server's Prometheus names onto the columns; picked by metric prefix, forced per
     backend, overridden or extended in the config ([adapters.<name>], "base" to
     inherit).  --list-adapters prints the built-ins as TOML to start from.
-  * Bandwidth peak: peak_gbps in the config or --peak, else looked up from the GPU
-    name (PEAKS below), else the MEM IO bar shows GB/s without a percentage.
+  * Bandwidth peak: --peak, peak_gbps in the config, a measurement saved for this GPU,
+    else the spec looked up from the GPU name (PEAKS below).  With none of the first
+    three, an interactive start offers to measure (the user knows whether the GPU is
+    idle); --measure does it on demand.  Saved per GPU UUID in
+    ~/.local/state/nvtokentop/bandwidth.json.
   * Weights for servers that do not export them (vLLM, llama.cpp): weights_gb per
     backend or per model ([models."<name>"]).
 Config: --config, $NVTOKENTOP_CONFIG, ~/.config/nvtokentop/config.toml, then
@@ -79,7 +82,7 @@ import urllib.request
 from collections import deque
 from datetime import datetime
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 try:
     import tomllib
@@ -833,6 +836,218 @@ def backend_procs(backends):
     return result
 
 
+# ----------------------------------------------------------------------------- bandwidth probe
+
+class ProbeError(Exception):
+    pass
+
+
+def probe_bandwidth(size=512 << 20, iters=20, trials=3):
+    """Attainable memory bandwidth in GB/s: device-to-device copies through the CUDA
+    driver API (libcuda via ctypes, no other dependencies), best of a few trials.  Each
+    byte copied is read once and written once, so GB/s = 2 x size x iters / seconds.
+    Uses two buffers of `size` bytes and takes about a second on a 273 GB/s part."""
+    import ctypes
+    try:
+        cu = ctypes.CDLL("libcuda.so.1")
+    except OSError as e:
+        raise ProbeError(f"no CUDA driver library ({e})")
+
+    def ck(rc, what):
+        if rc != 0:
+            s = ctypes.c_char_p()
+            cu.cuGetErrorString(rc, ctypes.byref(s))
+            raise ProbeError(f"{what} failed: {(s.value or b'').decode() or rc}")
+
+    ck(cu.cuInit(0), "cuInit")
+    dev = ctypes.c_int()
+    ck(cu.cuDeviceGet(ctypes.byref(dev), 0), "cuDeviceGet")
+    ctx = ctypes.c_void_p()
+    ck(cu.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), dev), "cuDevicePrimaryCtxRetain")
+    bufs, events = [], []
+    try:
+        ck(cu.cuCtxSetCurrent(ctx), "cuCtxSetCurrent")
+        for fill in (1, 2):
+            p = ctypes.c_uint64()
+            ck(cu.cuMemAlloc_v2(ctypes.byref(p), ctypes.c_size_t(size)), "cuMemAlloc")
+            bufs.append(p)
+            ck(cu.cuMemsetD8_v2(p, ctypes.c_ubyte(fill), ctypes.c_size_t(size)), "cuMemset")
+        for _ in range(2):
+            e = ctypes.c_void_p()
+            ck(cu.cuEventCreate(ctypes.byref(e), 0), "cuEventCreate")
+            events.append(e)
+        ck(cu.cuCtxSynchronize(), "cuCtxSynchronize")
+        src, dst = bufs
+
+        def run(n):
+            ck(cu.cuEventRecord(events[0], None), "cuEventRecord")
+            for _ in range(n):
+                ck(cu.cuMemcpyDtoDAsync_v2(dst, src, ctypes.c_size_t(size), None), "cuMemcpyDtoD")
+            ck(cu.cuEventRecord(events[1], None), "cuEventRecord")
+            ck(cu.cuEventSynchronize(events[1]), "cuEventSynchronize")
+            ms_ = ctypes.c_float()
+            ck(cu.cuEventElapsedTime(ctypes.byref(ms_), events[0], events[1]), "cuEventElapsedTime")
+            return 2.0 * size * n / (ms_.value / 1e3) / GB
+
+        run(2)  # warm up
+        return max(run(iters) for _ in range(trials))
+    finally:
+        for e in events:
+            cu.cuEventDestroy_v2(e)
+        for p in bufs:
+            cu.cuMemFree_v2(p)
+        cu.cuDevicePrimaryCtxRelease_v2(dev)
+
+
+def state_path():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "nvtokentop", "bandwidth.json")
+
+
+def load_state():
+    try:
+        with open(state_path()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    path = state_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def gpu_identity():
+    """(uuid, name) of GPU 0, or (None, None)."""
+    if not shutil.which("nvidia-smi"):
+        return None, None
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=uuid,name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=3).stdout.splitlines()
+        uuid, name = [x.strip() for x in out[0].split(",", 1)]
+        return uuid, name
+    except (subprocess.SubprocessError, ValueError, IndexError):
+        return None, None
+
+
+def activity(backends):
+    """model -> a number that grows whenever the server decodes or prefills (summed
+    token and pass counters).  Two snapshots that differ mean the server was busy."""
+    out = {}
+    for b in backends.values():
+        if b.kind is None:
+            b._detect()
+        if b.kind != "llm":
+            continue
+        try:
+            m = parse_prom(http_get(b.proxy + "/metrics"))
+        except (urllib.error.URLError, OSError, ValueError):
+            continue
+        sp = b.spec
+        out[b.model] = sum(counter(m, sp.get(k)) or 0.0
+                           for k in ("gen_live", "prompt_live", "passes", "gen_total", "prompt_total"))
+    return out
+
+
+def busy_now(backends, sse, before, after):
+    """Models that worked between two activity() snapshots, plus anything llama-swap
+    reports in flight (which covers image renders)."""
+    names = {m for m in after if after[m] != before.get(m, after[m])}
+    names |= {m for m, n in sse.all_inflight().items() if n}
+    return sorted(names)
+
+
+def ask(prompt, choices, default=None):
+    """Read an answer; keys of `choices` map to the words that pick them.  An unknown
+    answer asks again, or returns `default` when one is given."""
+    while True:
+        try:
+            ans = input(prompt).strip().lower()
+        except EOFError:
+            return default
+        for key, words in choices.items():
+            if ans in words:
+                return key
+        if default is not None:
+            return default
+
+
+def measure(sources, sse, window, name, interactive):
+    """Run the probe, refusing a result taken while a model was working.  Returns GB/s
+    or None."""
+    backends, _err = sources.discover({}, window)
+    before = activity(backends)
+    time.sleep(1.5)
+    mid = activity(backends)
+    busy = busy_now(backends, sse, before, mid)
+    if busy:
+        print(f"  Busy right now: {', '.join(busy)}.  A measurement now would come out low.")
+        if not interactive or ask("  Measure anyway? [y/N] ", {"y": ("y", "yes")}, default="n") != "y":
+            return None
+    print(f"  Measuring {name or 'GPU 0'} (two 512 MiB buffers, about a second) ...", flush=True)
+    try:
+        gbps = probe_bandwidth()
+    except ProbeError as e:
+        print(f"  Could not measure: {e}")
+        return None
+    after = activity(backends)
+    busy = busy_now(backends, sse, mid, after)
+    if busy:
+        print(f"  {', '.join(busy)} worked during the measurement, so {gbps:.0f} GB/s is low; not saved.")
+        return None
+    print(f"  Measured {gbps:.0f} GB/s (device-to-device copy, read + write).")
+    return gbps
+
+
+def resolve_peak(args, cfg, sse):
+    """(GB/s, source) for the MEM IO percentage.  Order: --peak, peak_gbps in the config,
+    a measurement saved for this GPU, the spec table.  On an interactive start with none
+    of the first three, offer to measure (the user knows whether the GPU is idle)."""
+    if args.peak is not None and not args.measure:
+        return args.peak, "flag"
+    if "peak_gbps" in cfg and not args.measure:
+        return float(cfg["peak_gbps"]), "config"
+    uuid, name = gpu_identity()
+    spec, _needle = peak_for(name)
+    state = load_state()
+    entry = state.get(uuid) if uuid else None
+    interactive = sys.stdin.isatty() and sys.stdout.isatty() and not args.plain
+    want = args.measure
+    if uuid and entry is None and interactive and not want:
+        spec_txt = f"its spec figure is {spec:.0f} GB/s" if spec else "it is not in the spec table"
+        print(f"nvtokentop: memory bandwidth for {name} has not been measured on this machine "
+              f"({spec_txt}).\n"
+              f"Measuring takes about a second and is only right while the GPU is idle: no requests\n"
+              f"decoding, no images rendering.  The result is saved in {state_path()}.")
+        choice = ask("Measure now? [y]es / [n]ot now / ne[v]er ask: ",
+                     {"y": ("y", "yes"), "n": ("", "n", "no", "not now"), "v": ("v", "never")})
+        if choice == "v":
+            state[uuid] = {"name": name, "declined": True,
+                           "at": datetime.now().astimezone().isoformat(timespec="seconds")}
+            save_state(state)
+            entry = state[uuid]
+        want = choice == "y"
+    if want and uuid:
+        gbps = measure(args.sources, sse, args.window, name, interactive)
+        args.measured = gbps
+        if gbps:
+            state[uuid] = {"name": name, "gbps": round(gbps, 1), "spec_gbps": spec or None,
+                           "at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                           "method": "cuMemcpyDtoD 2 x 512 MiB, best of 3"}
+            save_state(state)
+            entry = state[uuid]
+    elif want:
+        print("  No NVIDIA GPU found (nvidia-smi), nothing to measure.")
+    if entry and entry.get("gbps"):
+        return float(entry["gbps"]), "measured"
+    return spec, "spec" if spec else ""
+
+
 # ----------------------------------------------------------------------------- drawing
 
 def nice_max(v, floor=10.0):
@@ -965,10 +1180,10 @@ def total_gbps(backends):
     return sum(b.rates.get("gbps") or 0.0 for b in backends.values())
 
 
-def io_text(total, peak):
+def io_text(total, peak, src=""):
     if peak:
-        return f"~{total:.0f}/{peak:.0f} GB/s {total / peak * 100:.0f}%"
-    return f"~{total:.0f} GB/s (no peak: set peak_gbps)"
+        return f"~{total:.0f}/{peak:.0f} GB/s {total / peak * 100:.0f}%" + (f" {src}" if src else "")
+    return f"~{total:.0f} GB/s (no peak: run --measure or set peak_gbps)"
 
 
 # ----------------------------------------------------------------------------- modes
@@ -996,7 +1211,7 @@ def run_plain(args, backends, sse):
             rl = f"RAM {ram[0]:.0f}% ({ram[1]:.0f}/{ram[2]:.0f} GiB)" if ram else "RAM -"
             io = total_gbps(backends)
             ev = ("ok" if sse.connected else "down") if sse.available else "none"
-            print(f"{stamp} {cl}  {gl}  mem IO {io_text(io, args.peak)}  {rl}  events {ev}")
+            print(f"{stamp} {cl}  {gl}  mem IO {io_text(io, args.peak, args.peak_src)}  {rl}  events {ev}")
             print("         " + TABLE_FMT.format(*TABLE_HDR))
             for b in backends.values():
                 print("         " + table_row(b, None))
@@ -1081,7 +1296,7 @@ def run_tui(stdscr, args, backends, sse):
         put(1, half + 1, bar("GPU", (g["util"] / 100) if g else 0, w - half - 2,
                              f"{g['util']:.0f}%" if g else "n/a"), cp(1))
         put(2, 0, bar("MEM IO", total / args.peak if args.peak else 0, half,
-                      io_text(total, args.peak)), cp(3))
+                      io_text(total, args.peak, args.peak_src)), cp(3))
         put(2, half + 1, bar("RAM", (ram[0] / 100) if ram else 0, w - half - 2,
                              f"{ram[1]:.1f}/{ram[2]:.1f}Gi {ram[0]:.0f}%" if ram else "n/a"), cp(2))
         status = f"KV {kv * 100:.0f}%  {n_inflight} req in flight"
@@ -1188,7 +1403,10 @@ def main():
                     help="a model server to watch directly; repeatable")
     ap.add_argument("-i", "--interval", type=float, help="seconds between samples (default 1)")
     ap.add_argument("-w", "--window", type=float, help="seconds for the avg columns (default 30)")
-    ap.add_argument("--peak", type=float, help="memory bandwidth spec, GB/s (default: from the GPU name)")
+    ap.add_argument("--peak", type=float,
+                    help="memory bandwidth for the MEM IO %%, GB/s (default: measured, else the GPU's spec)")
+    ap.add_argument("--measure", action="store_true",
+                    help="measure memory bandwidth now (GPU idle), save it for this GPU, and exit")
     ap.add_argument("--plain", action="store_true", help="print blocks instead of the curses TUI")
     ap.add_argument("-n", "--count", type=int, default=0, help="with --plain: stop after N samples")
     ap.add_argument("--list-adapters", action="store_true", help="print the metric adapters as TOML and exit")
@@ -1210,18 +1428,34 @@ def main():
             sys.exit(f"nvtokentop: every backend needs a name and a url ({cfg_path or '--backend'})")
     args.sources = Sources(router, llama_swap, static, cfg.get("models") or {}, adapters)
 
-    if args.peak is None:
-        args.peak = float(cfg["peak_gbps"]) if "peak_gbps" in cfg else peak_for((gpu_stats() or {}).get("name"))[0]
-
     backends = {}
     sse = Inflight(llama_swap) if router == "llama-swap" else NoEvents()
     sse.start()
+    for _ in range(20):  # let the event stream deliver its snapshot before any busy check
+        if sse.connected or sse.error:
+            break
+        time.sleep(0.05)
+    args.measured = None
+    args.peak, args.peak_src = resolve_peak(args, cfg, sse)
+    if args.measure:
+        if args.measured:
+            print(f"  Saved for this GPU in {state_path()}.")
+        return 0 if args.measured else 1
     if args.plain or not sys.stdout.isatty():
         try:
             return run_plain(args, backends, sse)
         except KeyboardInterrupt:
             return 0
-    return curses.wrapper(run_tui, args, backends, sse)
+    try:
+        return curses.wrapper(run_tui, args, backends, sse)
+    except curses.error as e:
+        if "setupterm" not in str(e):
+            raise
+        print(f"nvtokentop: no usable terminal ({e}); printing plain blocks instead", file=sys.stderr)
+        try:
+            return run_plain(args, backends, sse)
+        except KeyboardInterrupt:
+            return 0
 
 
 if __name__ == "__main__":

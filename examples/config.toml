@@ -6,7 +6,8 @@
 router = "llama-swap"
 llama_swap = "http://127.0.0.1:8000"
 
-# Memory bandwidth spec in GB/s.  Leave it out to look it up from the GPU name.
+# Memory bandwidth in GB/s for the MEM IO %.  Leave it out to use the figure measured
+# on this GPU (nvtokentop offers on first start, or run --measure), else the spec.
 # peak_gbps = 273
 
 interval = 1.0   # seconds between samples
